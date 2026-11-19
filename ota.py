@@ -8,6 +8,10 @@ No `gh` needed. Talks to the GitHub API directly and uploads with curl
 No ROM directory is hardcoded: it searches the server for the newest
 Project_Infinity-X zip and reads version / build type / date from it.
 
+Publishes to the OTA repo:
+  - spes.json     (what the ROM's ota_url points to)
+  - changelog.txt (what the ROM's changelog_url points to)
+
 Usage (python3, NOT bash):
     export GH_TOKEN=github_pat_xxx
     python3 ota.py -m "Changelog text"
@@ -48,7 +52,12 @@ ROM_NAME = "Project Infinity X"
 DEVICE_NAME = "Redmi Note 11"
 DEVICE_CODENAME = "spes"
 
-OTA_JSON = "ota-v2.json"
+# Must match the URLs in the ROM's overlay XML:
+#   https://raw.githubusercontent.com/sehraan/infinity_ota/main/spes.json
+#   https://raw.githubusercontent.com/sehraan/infinity_ota/main/changelog.txt
+OTA_JSON = f"{DEVICE_CODENAME}.json"
+LEGACY_OTA_JSON = "ota-v2.json"   # old name, auto-renamed on first run
+CHANGELOG_TXT = "changelog.txt"
 DEFAULT_OTA_REPO_PATH = os.path.expanduser("~/infinity_ota_repo")
 
 UPLOAD_TIMEOUT = 3600       # max seconds per file upload attempt
@@ -343,7 +352,7 @@ def publish_release(tag, info, files, changelog):
 
 
 # =========================================================
-# OTA JSON
+# OTA JSON + CHANGELOG
 # =========================================================
 
 FIELD_ALIASES = {
@@ -392,6 +401,15 @@ def update_ota_json(json_path, values):
         f.write("\n")
 
 
+def write_changelog(path, info, changelog):
+    text = (
+        f"{ROM_NAME} {info['version']} ({info['type']}) - {info['date']}\n\n"
+        f"{changelog}\n"
+    )
+    with open(path, "w") as f:
+        f.write(text)
+
+
 # =========================================================
 # GIT (plain git + token header, no gh)
 # =========================================================
@@ -418,8 +436,17 @@ def ensure_ota_repo(path):
     git(["pull", "--rebase"], cwd=path)
 
 
+def migrate_legacy_json(path):
+    """Rename ota-v2.json -> spes.json once, keeping its history/fields."""
+    new = os.path.join(path, OTA_JSON)
+    old = os.path.join(path, LEGACY_OTA_JSON)
+    if not os.path.exists(new) and os.path.exists(old):
+        print(f"🔁 Renaming {LEGACY_OTA_JSON} -> {OTA_JSON}")
+        git(["mv", LEGACY_OTA_JSON, OTA_JSON], cwd=path)
+
+
 def push_json(path, tag):
-    git(["add", OTA_JSON], cwd=path)
+    git(["add", OTA_JSON, CHANGELOG_TXT], cwd=path)
     commit = git(
         ["-c", f"user.name={REPO_OWNER}",
          "-c", f"user.email={REPO_OWNER}@users.noreply.github.com",
@@ -492,7 +519,7 @@ def upload_and_push():
     print(f"Device:     {DEVICE_NAME} ({info['codename']})")
     print(f"Boot image: {boot_path or 'not found, skipping'}")
     print(f"Tag:        {tag}")
-    print(f"To repo:    {REPO}")
+    print(f"To repo:    {REPO}  ({OTA_JSON}, {CHANGELOG_TXT})")
     print(f"Changelog:  {changelog}")
     print()
 
@@ -514,11 +541,12 @@ def upload_and_push():
 
     download_url = f"https://github.com/{REPO}/releases/download/{tag}/{filename}"
 
-    # ---------- OTA JSON ----------
+    # ---------- OTA JSON + changelog ----------
     print("🧮 Calculating checksum...")
     sha256, size, timestamp = get_file_info(zip_path)
 
     ensure_ota_repo(args.ota_repo)
+    migrate_legacy_json(args.ota_repo)
 
     update_ota_json(
         os.path.join(args.ota_repo, OTA_JSON),
@@ -533,8 +561,9 @@ def upload_and_push():
             "changelog": changelog,
         },
     )
+    write_changelog(os.path.join(args.ota_repo, CHANGELOG_TXT), info, changelog)
 
-    print("📤 Pushing OTA JSON...")
+    print("📤 Pushing OTA JSON + changelog...")
     push_json(args.ota_repo, tag)
 
     print("✅ OTA update complete!")
@@ -543,3 +572,4 @@ def upload_and_push():
 
 if __name__ == "__main__":
     upload_and_push()
+    
