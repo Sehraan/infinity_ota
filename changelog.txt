@@ -1,2 +1,3 @@
-Synced with the latest device tree
-Video call issues across various social media apps fixed 
+Project Infinity X 4.2 (VANILLA) - 22.11.2026
+
+fixed some minor errors
