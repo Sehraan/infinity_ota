@@ -12,19 +12,26 @@ Publishes to the OTA repo:
   - spes.json     (what the ROM's ota_url points to)
   - changelog.txt (what the ROM's changelog_url points to)
 
+JSON format = the one Infinity X's Updater reads:
+  filename, download, timestamp, md5, size, version
+
 Usage (python3, NOT bash):
-    export GH_TOKEN=github_pat_xxx
     python3 ota.py -m "Changelog text"
     python3 ota.py -m "Changelog" -y
     python3 ota.py --zip /any/path/rom.zip
     python3 ota.py --search-root /mnt/data
 
-Needs: python3, curl, git. Token needs access to the OTA repo
-(classic token: "repo" scope; fine-grained: Contents read+write).
+Token: either `export GH_TOKEN=github_pat_xxx` first, or just run the
+script and paste the token when asked (it stays hidden on screen).
+The token must belong to the account that owns the OTA repo and have
+Contents read+write (fine-grained) or "repo" scope (classic).
+
+Needs: python3, curl, git.
 """
 
 import argparse
 import base64
+import getpass
 import glob
 import hashlib
 import json
@@ -121,14 +128,27 @@ def api(method, path, payload=None):
 
 
 def check_token():
+    global TOKEN
     if not TOKEN:
-        die("No token. Run:  export GH_TOKEN=your_real_token  and try again.")
+        TOKEN = getpass.getpass("GitHub token (hidden, paste and press Enter): ").strip()
+    if not TOKEN:
+        die("No token given.")
+
     print("🔑 Checking GitHub token...")
-    code, data = api("GET", f"/repos/{REPO}")
+    code, me = api("GET", "/user")
     if code == 401:
         die("GitHub says the token is invalid or revoked. Make a new one.")
+    login = (me or {}).get("login", "?")
+    print(f"   token belongs to: {login}")
+    if login.lower() != REPO_OWNER.lower():
+        print(f"⚠️  This token belongs to '{login}', but the repo is owned by "
+              f"'{REPO_OWNER}'.")
+        print(f"   It only works if '{login}' has write access to {REPO}.")
+
+    code, data = api("GET", f"/repos/{REPO}")
     if code == 404:
-        die(f"Repo {REPO} not found, or the token has no access to it.")
+        die(f"Repo {REPO} not found, or the token has no access to it. "
+            f"Make the token as '{REPO_OWNER}' and select this repo.")
     if code != 200:
         die(f"GitHub API error {code}: {data}")
     perms = (data or {}).get("permissions", {})
@@ -233,15 +253,28 @@ def get_build_info(path):
             "type": "GAPPS" if "GAPPS" in path.upper() else "VANILLA",
         }
     info["sdk"] = meta.get("post-sdk-level", "")
+    info["meta"] = meta
     return info
 
 
 def get_file_info(path):
+    """Returns (sha256, md5, size_bytes, file_mtime)."""
     sha = hashlib.sha256()
+    md5 = hashlib.md5()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             sha.update(chunk)
-    return sha.hexdigest(), os.path.getsize(path), int(os.path.getmtime(path))
+            md5.update(chunk)
+    return sha.hexdigest(), md5.hexdigest(), os.path.getsize(path), int(os.path.getmtime(path))
+
+
+def build_timestamp(meta, fallback):
+    """The phone compares this to the installed build's date, so use the
+    build time stored inside the zip (post-timestamp), not the file time."""
+    try:
+        return int(meta.get("post-timestamp", ""))
+    except ValueError:
+        return fallback
 
 
 def find_boot_img(zip_path):
@@ -285,7 +318,7 @@ def upload_asset(release_id, path, auth_header_file):
         "-H", f"@{auth_header_file}",
         "-H", "Accept: application/vnd.github+json",
         "-H", "Content-Type: application/octet-stream",
-        "-T", path,
+        "-T", path,   # streams the file; --data-binary would load it all in RAM
         "--connect-timeout", "30",
         "--speed-limit", "1024", "--speed-time", str(STALL_SECONDS),
         "--max-time", str(UPLOAD_TIMEOUT),
@@ -355,47 +388,20 @@ def publish_release(tag, info, files, changelog):
 # OTA JSON + CHANGELOG
 # =========================================================
 
-FIELD_ALIASES = {
-    "filename": ["filename", "file_name"],
-    "url": ["url", "download", "download_url"],
-    "size": ["size"],
-    "sha256": ["sha256", "id"],
-    "timestamp": ["datetime", "timestamp"],
-    "version": ["version"],
-    "release_type": ["romtype", "buildtype", "type"],
-    "changelog": ["changelog"],
-}
-
-
-def set_field(entry, field, value):
-    aliases = FIELD_ALIASES[field]
-    present = [k for k in aliases if k in entry]
-    if present:
-        for k in present:
-            entry[k] = value
-    else:
-        entry[aliases[0]] = value
-
-
-def update_ota_json(json_path, values):
-    if os.path.exists(json_path):
-        with open(json_path) as f:
-            data = json.load(f)
-    else:
-        data = {"response": [{}]}
-
-    if isinstance(data, dict) and isinstance(data.get("response"), list):
-        if not data["response"]:
-            data["response"].append({})
-        entry = data["response"][0]
-    elif isinstance(data, dict):
-        entry = data
-    else:
-        die(f"Unexpected format in {json_path}")
-
-    for field, value in values.items():
-        set_field(entry, field, value)
-
+def write_ota_json(json_path, values):
+    """Writes the file fresh in the format the Infinity X Updater reads."""
+    data = {
+        "response": [
+            {
+                "filename": values["filename"],
+                "download": values["download"],
+                "timestamp": values["timestamp"],
+                "md5": values["md5"],
+                "size": values["size"],
+                "version": values["version"],
+            }
+        ]
+    }
     with open(json_path, "w") as f:
         json.dump(data, f, indent=2)
         f.write("\n")
@@ -411,7 +417,7 @@ def write_changelog(path, info, changelog):
 
 
 # =========================================================
-# GIT (plain git + token header, no gh)
+# GIT (plain git + token header, no gh, ignores saved logins)
 # =========================================================
 
 def git(args, cwd=None, check=True):
@@ -419,9 +425,15 @@ def git(args, cwd=None, check=True):
     env = dict(os.environ)
     env.update({
         "GIT_TERMINAL_PROMPT": "0",
-        "GIT_CONFIG_COUNT": "1",
-        "GIT_CONFIG_KEY_0": "http.extraheader",
-        "GIT_CONFIG_VALUE_0": f"Authorization: Basic {basic}",
+        # ignore any saved/global git login on the server (this is what made
+        # pushes go out as the wrong account)
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_COUNT": "2",
+        "GIT_CONFIG_KEY_0": "credential.helper",
+        "GIT_CONFIG_VALUE_0": "",
+        "GIT_CONFIG_KEY_1": "http.extraheader",
+        "GIT_CONFIG_VALUE_1": f"Authorization: Basic {basic}",
     })
     return subprocess.run(
         ["git"] + args, cwd=cwd, env=env, check=check, timeout=300
@@ -432,12 +444,15 @@ def ensure_ota_repo(path):
     if not os.path.isdir(os.path.join(path, ".git")):
         print(f"📥 Cloning {REPO} to {path}...")
         git(["clone", f"https://github.com/{REPO}.git", path])
-    git(["checkout", "main"], cwd=path)
-    git(["pull", "--rebase"], cwd=path)
+    # always start from exactly what is on GitHub (drops leftovers from a
+    # failed earlier run)
+    git(["fetch", "origin"], cwd=path)
+    git(["checkout", "-B", "main", "origin/main"], cwd=path)
+    git(["reset", "--hard", "origin/main"], cwd=path)
 
 
 def migrate_legacy_json(path):
-    """Rename ota-v2.json -> spes.json once, keeping its history/fields."""
+    """Rename ota-v2.json -> spes.json once, keeping its history."""
     new = os.path.join(path, OTA_JSON)
     old = os.path.join(path, LEGACY_OTA_JSON)
     if not os.path.exists(new) and os.path.exists(old):
@@ -542,23 +557,22 @@ def upload_and_push():
     download_url = f"https://github.com/{REPO}/releases/download/{tag}/{filename}"
 
     # ---------- OTA JSON + changelog ----------
-    print("🧮 Calculating checksum...")
-    sha256, size, timestamp = get_file_info(zip_path)
+    print("🧮 Calculating checksums...")
+    sha256, md5, size, file_time = get_file_info(zip_path)
+    timestamp = build_timestamp(info.get("meta", {}), file_time)
 
     ensure_ota_repo(args.ota_repo)
     migrate_legacy_json(args.ota_repo)
 
-    update_ota_json(
+    write_ota_json(
         os.path.join(args.ota_repo, OTA_JSON),
         {
             "filename": filename,
-            "url": download_url,
-            "size": size,
-            "sha256": sha256,
+            "download": download_url,
             "timestamp": timestamp,
+            "md5": md5,
+            "size": size,
             "version": info["version"],
-            "release_type": info["type"],
-            "changelog": changelog,
         },
     )
     write_changelog(os.path.join(args.ota_repo, CHANGELOG_TXT), info, changelog)
@@ -568,8 +582,8 @@ def upload_and_push():
 
     print("✅ OTA update complete!")
     print(f"   {download_url}")
+    print(f"   JSON: https://raw.githubusercontent.com/{REPO}/main/{OTA_JSON}")
 
 
 if __name__ == "__main__":
     upload_and_push()
-    
